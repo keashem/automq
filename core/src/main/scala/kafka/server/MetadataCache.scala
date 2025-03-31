@@ -26,7 +26,9 @@ import org.apache.kafka.metadata.BrokerRegistration
 import org.apache.kafka.server.common.automq.AutoMQVersion
 import org.apache.kafka.server.common.{FinalizedFeatures, KRaftVersion, MetadataVersion}
 
+import java.nio.ByteBuffer
 import java.util
+import java.util.OptionalLong
 import java.util.function.Supplier
 import scala.collection._
 
@@ -120,6 +122,10 @@ trait MetadataCache {
   def getPartitionLeaderNode(topicName: String, partitionId: Int): BrokerRegistration
 
   def getNode(nodeId: Int): BrokerRegistration
+
+  def getValue(key: String): ByteBuffer
+
+  def getStreamEndOffset(streamId: Long): OptionalLong
   // AutoMQ inject end
 }
 

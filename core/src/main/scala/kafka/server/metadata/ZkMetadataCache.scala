@@ -18,7 +18,7 @@
 package kafka.server.metadata
 
 import java.util
-import java.util.{Collections, Optional}
+import java.util.{Collections, Optional, OptionalLong}
 import java.util.concurrent.locks.{ReentrantLock, ReentrantReadWriteLock}
 import scala.collection.{Seq, Set, mutable}
 import scala.jdk.CollectionConverters._
@@ -44,6 +44,7 @@ import org.apache.kafka.metadata.BrokerRegistration
 import org.apache.kafka.server.common.automq.AutoMQVersion
 import org.apache.kafka.server.common.{FinalizedFeatures, MetadataVersion}
 
+import java.nio.ByteBuffer
 import java.util.concurrent.{ThreadLocalRandom, TimeUnit}
 import scala.concurrent.TimeoutException
 import scala.math.max
@@ -725,6 +726,14 @@ class ZkMetadataCache(
   }
 
   override def getNode(nodeId: Int): BrokerRegistration = {
+    throw new UnsupportedOperationException()
+  }
+
+  override def getValue(key: String): ByteBuffer = {
+    throw new UnsupportedOperationException()
+  }
+
+  override def getStreamEndOffset(streamId: Long): OptionalLong = {
     throw new UnsupportedOperationException()
   }
   // AutoMQ inject end

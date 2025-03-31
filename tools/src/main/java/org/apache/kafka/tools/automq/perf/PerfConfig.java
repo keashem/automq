@@ -12,6 +12,7 @@
 package org.apache.kafka.tools.automq.perf;
 
 import org.apache.kafka.common.utils.Exit;
+import org.apache.kafka.common.utils.Utils;
 import org.apache.kafka.tools.automq.perf.ConsumerService.ConsumersConfig;
 import org.apache.kafka.tools.automq.perf.ProducerService.ProducersConfig;
 import org.apache.kafka.tools.automq.perf.TopicService.TopicsConfig;
@@ -24,20 +25,23 @@ import net.sourceforge.argparse4j.inf.ArgumentParserException;
 import net.sourceforge.argparse4j.inf.Namespace;
 import net.sourceforge.argparse4j.internal.HelpScreenException;
 
+import java.io.IOException;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Properties;
 import java.util.Random;
 import java.util.concurrent.ThreadLocalRandom;
 
 import static net.sourceforge.argparse4j.impl.Arguments.storeTrue;
+import static org.apache.kafka.tools.automq.perf.PerfConfig.IntegerArgumentType.between;
 import static org.apache.kafka.tools.automq.perf.PerfConfig.IntegerArgumentType.nonNegativeInteger;
 import static org.apache.kafka.tools.automq.perf.PerfConfig.IntegerArgumentType.notLessThan;
 import static org.apache.kafka.tools.automq.perf.PerfConfig.IntegerArgumentType.positiveInteger;
 
 public class PerfConfig {
     public final String bootstrapServer;
-    public final Map<String, String> commonConfigs;
+    public final Properties commonConfigs;
     public final Map<String, String> topicConfigs;
     public final Map<String, String> producerConfigs;
     public final Map<String, String> consumerConfigs;
@@ -53,6 +57,7 @@ public class PerfConfig {
     public final int randomPoolSize;
     public final int sendRate;
     public final int sendRateDuringCatchup;
+    public final int maxConsumeRecordRate;
     public final int backlogDurationSeconds;
     public final int groupStartDelaySeconds;
     public final int warmupDurationMinutes;
@@ -76,7 +81,7 @@ public class PerfConfig {
         assert ns != null;
 
         bootstrapServer = ns.getString("bootstrapServer");
-        commonConfigs = parseConfigs(ns.getList("commonConfigs"));
+        commonConfigs = ns.getString("commonConfigFile") == null ? new Properties() : loadProperties(ns.getString("commonConfigFile"));
         topicConfigs = parseConfigs(ns.getList("topicConfigs"));
         producerConfigs = parseConfigs(ns.getList("producerConfigs"));
         consumerConfigs = parseConfigs(ns.getList("consumerConfigs"));
@@ -92,6 +97,7 @@ public class PerfConfig {
         randomPoolSize = ns.getInt("randomPoolSize");
         sendRate = ns.getInt("sendRate");
         sendRateDuringCatchup = ns.getInt("sendRateDuringCatchup") == null ? sendRate : ns.getInt("sendRateDuringCatchup");
+        maxConsumeRecordRate = ns.getInt("maxConsumeRecordRate");
         backlogDurationSeconds = ns.getInt("backlogDurationSeconds");
         groupStartDelaySeconds = ns.getInt("groupStartDelaySeconds");
         warmupDurationMinutes = ns.getInt("warmupDurationMinutes");
@@ -117,12 +123,11 @@ public class PerfConfig {
             .dest("bootstrapServer")
             .metavar("BOOTSTRAP_SERVER")
             .help("The AutoMQ bootstrap server.");
-        parser.addArgument("-A", "--common-configs")
-            .nargs("*")
+        parser.addArgument("-F", "--common-config-file")
             .type(String.class)
-            .dest("commonConfigs")
-            .metavar("COMMON_CONFIG")
-            .help("The common configurations.");
+            .dest("commonConfigFile")
+            .metavar("COMMON_CONFIG_FILE")
+            .help("The property file containing common configurations to be passed to all clients —— producer, consumer, and admin.");
         parser.addArgument("-T", "--topic-configs")
             .nargs("*")
             .type(String.class)
@@ -209,6 +214,12 @@ public class PerfConfig {
             .dest("sendRateDuringCatchup")
             .metavar("SEND_RATE_DURING_CATCHUP")
             .help("The send rate in messages per second during catchup. If not set, the send rate will be used.");
+        parser.addArgument("-m", "--max-consume-record-rate")
+            .setDefault(1_000_000_000)
+            .type(between(0, 1_000_000_000))
+            .dest("maxConsumeRecordRate")
+            .metavar("MAX_CONSUME_RECORD_RATE")
+            .help("The max rate of consuming records per second.");
         parser.addArgument("-b", "--backlog-duration")
             .setDefault(0)
             .type(notLessThan(300))
@@ -256,13 +267,13 @@ public class PerfConfig {
         return bootstrapServer;
     }
 
-    public Map<String, String> adminConfig() {
-        return commonConfigs;
+    public Properties adminConfig() {
+        Properties properties = new Properties();
+        properties.putAll(commonConfigs);
+        return properties;
     }
 
     public TopicsConfig topicsConfig() {
-        Map<String, String> topicConfigs = new HashMap<>(commonConfigs);
-        topicConfigs.putAll(this.topicConfigs);
         return new TopicsConfig(
             topicPrefix,
             topics,
@@ -272,24 +283,34 @@ public class PerfConfig {
     }
 
     public ProducersConfig producersConfig() {
-        Map<String, String> producerConfigs = new HashMap<>(commonConfigs);
-        producerConfigs.putAll(this.producerConfigs);
+        Properties properties = new Properties();
+        properties.putAll(commonConfigs);
+        properties.putAll(producerConfigs);
         return new ProducersConfig(
             bootstrapServer,
             producersPerTopic,
-            producerConfigs
+            properties
         );
     }
 
     public ConsumersConfig consumersConfig() {
-        Map<String, String> consumerConfigs = new HashMap<>(commonConfigs);
-        consumerConfigs.putAll(this.consumerConfigs);
+        Properties properties = new Properties();
+        properties.putAll(commonConfigs);
+        properties.putAll(consumerConfigs);
         return new ConsumersConfig(
             bootstrapServer,
             groupsPerTopic,
             consumersPerGroup,
-            consumerConfigs
+            properties
         );
+    }
+
+    private Properties loadProperties(String filename) {
+        try {
+            return Utils.loadProps(filename);
+        } catch (IOException e) {
+            throw new RuntimeException(e);
+        }
     }
 
     private Map<String, String> parseConfigs(List<String> configs) {
@@ -350,6 +371,10 @@ public class PerfConfig {
 
         public static IntegerArgumentType notLessThan(int min) {
             return new IntegerArgumentType(value -> value < min ? "expected an integer not less than " + min + ", but got " + value : null);
+        }
+
+        public static IntegerArgumentType between(int min, int max) {
+            return new IntegerArgumentType(value -> value < min || value > max ? "expected an integer between " + min + " and " + max + ", but got " + value : null);
         }
     }
 

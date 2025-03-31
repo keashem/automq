@@ -4,9 +4,11 @@ import com.automq.stream.api.exceptions.FastReadFailFastException
 import com.automq.stream.s3.metrics.{MetricsLevel, TimerUtil}
 import com.automq.stream.utils.FutureUtil
 import com.automq.stream.utils.threads.S3StreamThreadPoolMonitor
+import kafka.automq.kafkalinking.KafkaLinkingManager
+import kafka.automq.partition.snapshot.PartitionSnapshotsManager
 import kafka.cluster.Partition
 import kafka.log.remote.RemoteLogManager
-import kafka.log.streamaspect.{ElasticLogManager, PartitionStatusTracker, ReadHint}
+import kafka.log.streamaspect.{ElasticLogManager, OpenHint, PartitionStatusTracker, ReadHint}
 import kafka.log.{LogManager, UnifiedLog}
 import kafka.server.Limiter.Handler
 import kafka.server.QuotaFactory.QuotaManagers
@@ -24,6 +26,7 @@ import org.apache.kafka.common.protocol.Errors
 import org.apache.kafka.common.record.{MemoryRecords, PooledRecords, PooledResource}
 import org.apache.kafka.common.requests.FetchRequest
 import org.apache.kafka.common.requests.FetchRequest.PartitionData
+import org.apache.kafka.common.requests.s3.{AutomqGetPartitionSnapshotRequest, AutomqGetPartitionSnapshotResponse}
 import org.apache.kafka.common.utils.{ThreadUtils, Time}
 import org.apache.kafka.common.{TopicIdPartition, TopicPartition, Uuid}
 import org.apache.kafka.image.{LocalReplicaChanges, MetadataImage, TopicsDelta}
@@ -38,7 +41,7 @@ import java.util
 import java.util.Optional
 import java.util.concurrent._
 import java.util.concurrent.atomic.{AtomicBoolean, AtomicInteger, AtomicLong, AtomicReference}
-import java.util.function.Consumer
+import java.util.function.{BiFunction, Consumer}
 import scala.collection.mutable.ArrayBuffer
 import scala.collection.{Seq, mutable}
 import scala.compat.java8.OptionConverters
@@ -182,6 +185,18 @@ class ElasticReplicaManager(
 
   private val partitionLifecycleListeners = new util.ArrayList[PartitionLifecycleListener]()
 
+  private var kafkaLinkingManager = Option.empty[KafkaLinkingManager]
+
+  private val partitionSnapshotsManager = new PartitionSnapshotsManager(time)
+
+  private val snapshotReadPartitions = new ConcurrentHashMap[TopicPartition, Partition]()
+
+  addPartitionLifecycleListener(new PartitionLifecycleListener {
+    override def onOpen(partition: Partition): Unit = partitionSnapshotsManager.onPartitionOpen(partition)
+
+    override def onClose(partition: Partition): Unit = partitionSnapshotsManager.onPartitionClose(partition)
+  })
+
   override def startup(): Unit = {
     super.startup()
     val haltBrokerOnFailure = metadataCache.metadataVersion().isLessThan(MetadataVersion.IBP_1_0_IV0)
@@ -203,6 +218,7 @@ class ElasticReplicaManager(
     val partitions = partitionsToStop.map(_.topicPartition)
     replicaFetcherManager.removeFetcherForPartitions(partitions)
     replicaAlterLogDirsManager.removeFetcherForPartitions(partitions)
+    kafkaLinkingManager.foreach(_.removePartitions(partitions.asJava))
 
     // Second remove deleted partitions from the partition map. Fetchers rely on the
     // ReplicaManager to get Partition's information so they must be stopped first.
@@ -271,9 +287,24 @@ class ElasticReplicaManager(
   /**
    * Remove the usage of [[Option]] in [[getPartition]] to avoid allocation
    */
-  def getPartitionV2(topicPartition: TopicPartition): HostedPartition = {
-    val partition = allPartitions.get(topicPartition)
+  override def getPartition(topicPartition: TopicPartition): HostedPartition = {
+    var partition = allPartitions.get(topicPartition)
+    if (partition == null) {
+      val p = snapshotReadPartitions.get(topicPartition)
+      if (p != null) {
+        partition = HostedPartition.Online(p)
+      }
+    }
     if (null == partition) {
+      HostedPartition.None
+    } else {
+      partition
+    }
+  }
+
+  def getPartitionWithoutSnapshotRead(topicPartition: TopicPartition): HostedPartition = {
+    val partition = allPartitions.get(topicPartition)
+    if (partition == null) {
       HostedPartition.None
     } else {
       partition
@@ -284,7 +315,7 @@ class ElasticReplicaManager(
    * Remove the usage of [[Either]] in [[getPartitionOrException]] to avoid allocation
    */
   def getPartitionOrExceptionV2(topicPartition: TopicPartition): Partition = {
-    getPartitionV2(topicPartition) match {
+    getPartition(topicPartition) match {
       case HostedPartition.Online(partition) =>
         partition
       case HostedPartition.Offline(partition) =>
@@ -908,6 +939,7 @@ class ElasticReplicaManager(
 
       replicaFetcherManager.removeFetcherForPartitions(newOfflinePartitions)
       replicaAlterLogDirsManager.removeFetcherForPartitions(newOfflinePartitions ++ partitionsWithOfflineFutureReplica.map(_.topicPartition))
+      kafkaLinkingManager.foreach(_.removePartitions(newOfflinePartitions.asJava))
 
       // These partitions should first be made offline to remove topic metrics.
       newOfflinePartitions.foreach { topicPartition =>
@@ -933,7 +965,7 @@ class ElasticReplicaManager(
     delta: TopicsDelta,
     topicId: Uuid,
     createHook: Consumer[Partition] = _ => {}): Option[(Partition, Boolean)] = {
-    getPartition(tp) match {
+    getPartitionWithoutSnapshotRead(tp) match {
       case HostedPartition.Offline(offlinePartition) =>
         if (offlinePartition.flatMap(p => p.topicId).contains(topicId)) {
           stateChangeLogger.warn(s"Unable to bring up new local leader $tp " +
@@ -976,6 +1008,7 @@ class ElasticReplicaManager(
         val partition = Partition(tp, time, this)
         createHook.accept(partition)
         allPartitions.put(tp, HostedPartition.Online(partition))
+        notifyPartitionOpen(partition)
         Some(partition, true)
     }
   }
@@ -1204,10 +1237,10 @@ class ElasticReplicaManager(
         val state = info.partition.toLeaderAndIsrPartitionState(tp, true)
         val partitionAssignedDirectoryId = directoryIds.find(_._1.topicPartition() == tp).map(_._2)
         partition.makeLeader(state, offsetCheckpoints, Some(info.topicId), partitionAssignedDirectoryId)
-        notifyPartitionOpen(partition)
       }).foreach { case (partition, _) =>
         try {
           changedPartitions.add(partition)
+          kafkaLinkingManager.foreach(_.addPartitions(Set(partition.topicPartition).asJava))
         } catch {
           case e: KafkaStorageException =>
             stateChangeLogger.info(s"Skipped the become-leader state change for $tp " +
@@ -1405,8 +1438,26 @@ class ElasticReplicaManager(
     }
   }
 
+  def handleGetPartitionSnapshotRequest(request: AutomqGetPartitionSnapshotRequest): AutomqGetPartitionSnapshotResponse = {
+    partitionSnapshotsManager.handle(request)
+  }
+
   def addPartitionLifecycleListener(listener: PartitionLifecycleListener): Unit = {
     partitionLifecycleListeners.add(listener)
+  }
+
+  def computeSnapshotReadPartition(topicPartition: TopicPartition,
+    remappingFunction: BiFunction[TopicPartition, Partition, Partition]): Partition = {
+    snapshotReadPartitions.compute(topicPartition, remappingFunction)
+  }
+
+  def newSnapshotReadPartition(topicIdPartition: TopicIdPartition): Partition = {
+    OpenHint.markSnapshotRead()
+    val partition = Partition.apply(topicIdPartition, time, this)
+    partition.leaderReplicaIdOpt = Some(localBrokerId)
+    partition.createLogIfNotExists(true, false, new LazyOffsetCheckpoints(highWatermarkCheckpoints), partition.topicId, Option.empty)
+    OpenHint.clear()
+    partition
   }
 
   private def notifyPartitionOpen(partition: Partition): Unit = {
@@ -1415,6 +1466,19 @@ class ElasticReplicaManager(
 
   private def notifyPartitionClose(partition: Partition): Unit = {
     partitionLifecycleListeners.forEach(listener => CoreUtils.swallow(listener.onClose(partition), this))
+  }
+
+  override def shutdown(checkpointHW: Boolean): Unit = {
+    kafkaLinkingManager.foreach(_.shutdown())
+    super.shutdown(checkpointHW)
+  }
+
+  def setKafkaLinkingManager(kafkaLinkingManager: KafkaLinkingManager): Unit = {
+      if (kafkaLinkingManager == null) {
+          this.kafkaLinkingManager = None
+      } else {
+          this.kafkaLinkingManager = Some(kafkaLinkingManager)
+      }
   }
 
 }

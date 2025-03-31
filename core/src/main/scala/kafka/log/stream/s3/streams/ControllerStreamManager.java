@@ -51,6 +51,7 @@ import com.automq.stream.s3.metadata.StreamMetadata;
 import com.automq.stream.s3.metadata.StreamState;
 import com.automq.stream.s3.streams.StreamCloseHook;
 import com.automq.stream.s3.streams.StreamManager;
+import com.automq.stream.s3.streams.StreamMetadataListener;
 import com.automq.stream.utils.FutureUtil;
 import com.automq.stream.utils.LogContext;
 
@@ -120,6 +121,7 @@ public class ControllerStreamManager implements StreamManager {
                             .map(m -> new StreamMetadata(m.streamId(), m.epoch(), m.startOffset(), m.endOffset(), StreamState.OPENED))
                             .collect(Collectors.toList()));
                     case NODE_EPOCH_EXPIRED:
+                    case NODE_FENCED:
                         logger.error("Node epoch expired: {}, code: {}", req, code);
                         throw code.exception();
                     default:
@@ -134,6 +136,11 @@ public class ControllerStreamManager implements StreamManager {
     @Override
     public CompletableFuture<List<StreamMetadata>> getStreams(List<Long> streamIds) {
         return CompletableFuture.completedFuture(this.streamMetadataManager.getStreamMetadataList(streamIds));
+    }
+
+    @Override
+    public StreamMetadataListener.Handle addMetadataListener(long streamId, StreamMetadataListener listener) {
+        return streamMetadataManager.addMetadataListener(streamId, listener);
     }
 
     @Override
@@ -177,6 +184,7 @@ public class ControllerStreamManager implements StreamManager {
                     return ResponseHandleResult.withSuccess(resp.streamId());
                 case NODE_EPOCH_EXPIRED:
                 case NODE_EPOCH_NOT_EXIST:
+                case NODE_FENCED:
                     logger.error("Node epoch expired or not exist: {}, code: {}", req, Errors.forCode(resp.errorCode()));
                     throw Errors.forCode(resp.errorCode()).exception();
                 default:
@@ -238,6 +246,7 @@ public class ControllerStreamManager implements StreamManager {
                         new StreamMetadata(streamId, epoch, resp.startOffset(), resp.nextOffset(), StreamState.OPENED));
                 case NODE_EPOCH_EXPIRED:
                 case NODE_EPOCH_NOT_EXIST:
+                case NODE_FENCED:
                     logger.error("Node epoch expired or not exist, stream {}, epoch {}, code: {}", streamId, epoch, code);
                     throw code.exception();
                 case STREAM_FENCED:
@@ -298,6 +307,7 @@ public class ControllerStreamManager implements StreamManager {
                     return ResponseHandleResult.withSuccess(null);
                 case NODE_EPOCH_EXPIRED:
                 case NODE_EPOCH_NOT_EXIST:
+                case NODE_FENCED:
                     logger.error("Node epoch expired or not exist: {}, code: {}", request, Errors.forCode(resp.errorCode()));
                     throw Errors.forCode(resp.errorCode()).exception();
                 case STREAM_NOT_EXIST:
@@ -375,6 +385,7 @@ public class ControllerStreamManager implements StreamManager {
                     return ResponseHandleResult.withSuccess(null);
                 case NODE_EPOCH_EXPIRED:
                 case NODE_EPOCH_NOT_EXIST:
+                case NODE_FENCED:
                     logger.error("Node epoch expired or not exist: {}, code: {}", request, Errors.forCode(resp.errorCode()));
                     throw Errors.forCode(resp.errorCode()).exception();
                 case STREAM_NOT_EXIST:
@@ -429,6 +440,7 @@ public class ControllerStreamManager implements StreamManager {
                     return ResponseHandleResult.withSuccess(null);
                 case NODE_EPOCH_EXPIRED:
                 case NODE_EPOCH_NOT_EXIST:
+                case NODE_FENCED:
                     logger.error("Node epoch expired or not exist: {}, code: {}", request, Errors.forCode(resp.errorCode()));
                     throw Errors.forCode(resp.errorCode()).exception();
                 case STREAM_NOT_EXIST:

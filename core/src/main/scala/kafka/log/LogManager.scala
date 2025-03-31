@@ -17,7 +17,7 @@
 
 package kafka.log
 
-import kafka.log.streamaspect.{ElasticLogManager, ElasticUnifiedLog}
+import kafka.log.streamaspect.{ElasticLogManager, ElasticUnifiedLog, OpenHint}
 
 import java.io._
 import java.nio.file.{Files, NoSuchFileException}
@@ -163,6 +163,10 @@ class LogManager(logDirs: Seq[File],
       () => if (_liveLogDirs.contains(dir)) 0 else 1,
       Map("logDirectory" -> dir.getAbsolutePath).asJava)
   }
+
+  // AutoMQ inject start
+  private val snapshotReadLogs = new Pool[TopicPartition, UnifiedLog]()
+  // AutoMQ inject end
 
   /**
    * Create and check validity of the given directories that are not in the given offline directories, specifically:
@@ -722,10 +726,14 @@ class LogManager(logDirs: Seq[File],
             val logs = logsInDir(localLogsByDir, dir)
 
             // update the last flush point
-            debug(s"Updating recovery points at $dir")
+            if (isDebugEnabled) {
+              debug(s"Updating recovery points at $dir")
+            }
             checkpointRecoveryOffsetsInDir(dir, logs)
 
-            debug(s"Updating log start offsets at $dir")
+            if (isDebugEnabled) {
+              debug(s"Updating log start offsets at $dir")
+            }
             checkpointLogStartOffsetsInDir(dir, logs)
 
             // mark that the shutdown was clean by creating marker file for log dirs that:
@@ -735,7 +743,9 @@ class LogManager(logDirs: Seq[File],
             if (hadCleanShutdownFlags.getOrDefault(logDirAbsolutePath, false) ||
                 loadLogsCompletedFlags.getOrDefault(logDirAbsolutePath, false)) {
               val cleanShutdownFileHandler = new CleanShutdownFileHandler(dir.getPath)
-              debug(s"Writing clean shutdown marker at $dir with broker epoch=$brokerEpoch")
+              if (isDebugEnabled) {
+                debug(s"Writing clean shutdown marker at $dir with broker epoch=$brokerEpoch")
+              }
               CoreUtils.swallow(cleanShutdownFileHandler.write(brokerEpoch), this)
             }
           }
@@ -958,8 +968,26 @@ class LogManager(logDirs: Seq[File],
   def getLog(topicPartition: TopicPartition, isFuture: Boolean = false): Option[UnifiedLog] = {
     if (isFuture)
       Option(futureLogs.get(topicPartition))
-    else
+    else {
+      // AutoMQ inject start
+      val log = currentLogs.get(topicPartition)
+      if (log != null) {
+        Option(log)
+      } else {
+        Option(snapshotReadLogs.get(topicPartition))
+      }
+      // AutoMQ inject end
+    }
+  }
+
+  def getLogWithoutFallback(topicPartition: TopicPartition, isFuture: Boolean = false, isSnapshotRead: Boolean = false) = {
+    if (isFuture) {
+      Option(futureLogs.get(topicPartition))
+    } else if (isSnapshotRead) {
+      Option(snapshotReadLogs.get(topicPartition))
+    } else {
       Option(currentLogs.get(topicPartition))
+    }
   }
 
   /**
@@ -1050,7 +1078,7 @@ class LogManager(logDirs: Seq[File],
       // Only Partition#makeLeader will create a new log, the ReplicaManager#asyncApplyDelta will ensure the same partition
       // sequentially operate. So it's safe without lock
 //    logCreationOrDeletionLock synchronized {
-      val log = getLog(topicPartition, isFuture).getOrElse {
+      val log = getLogWithoutFallback(topicPartition, isFuture, OpenHint.isSnapshotRead).getOrElse {
         // create the log if it has not already been created in another thread
         val now = time.milliseconds()
 
@@ -1096,7 +1124,7 @@ class LogManager(logDirs: Seq[File],
 
         val config = fetchLogConfig(topicPartition.topic)
         val log = if (ElasticLogManager.enabled()) {
-          ElasticLogManager.getOrCreateLog(logDir, config, scheduler, time, maxTransactionTimeoutMs, producerStateManagerConfig, brokerTopicStats, producerIdExpirationCheckIntervalMs, logDirFailureChannel, topicId, leaderEpoch)
+          ElasticLogManager.createLog(logDir, config, scheduler, time, maxTransactionTimeoutMs, producerStateManagerConfig, brokerTopicStats, producerIdExpirationCheckIntervalMs, logDirFailureChannel, topicId, leaderEpoch)
         } else {
           UnifiedLog(
             dir = logDir,
@@ -1117,8 +1145,15 @@ class LogManager(logDirs: Seq[File],
 
         if (isFuture)
           futureLogs.put(topicPartition, log)
-        else
-          currentLogs.put(topicPartition, log)
+        else {
+          // AutoMQ inject start
+          if (OpenHint.isSnapshotRead) {
+            snapshotReadLogs.put(topicPartition, log)
+          } else {
+            currentLogs.put(topicPartition, log)
+          }
+          // AutoMQ inject end
+        }
 
         info(s"Created log for partition $topicPartition in $logDir with properties ${config.overriddenConfigsAsLoggableString} cost ${time.milliseconds() - now}ms")
         // Remove the preferred log dir since it has already been satisfied
@@ -1363,8 +1398,12 @@ class LogManager(logDirs: Seq[File],
   }
 
   // AutoMQ for Kafka inject start
-  def removeFromCurrentLogs(topicPartition: TopicPartition): Unit = {
-    removeLogAndMetrics(currentLogs, topicPartition)
+  def removeFromCurrentLogs(topicPartition: TopicPartition, log: ElasticUnifiedLog): Unit = {
+    if (log.snapshotRead) {
+      removeLogAndMetrics(snapshotReadLogs, topicPartition)
+    } else {
+      removeLogAndMetrics(currentLogs, topicPartition)
+    }
   }
   // AutoMQ for Kafka inject end
 

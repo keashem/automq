@@ -89,6 +89,10 @@ public final class ServerTopicConfigSynonyms {
         sameName(TopicConfig.TABLE_TOPIC_COMMIT_INTERVAL_CONFIG),
         sameName(TopicConfig.TABLE_TOPIC_NAMESPACE_CONFIG),
         sameName(TopicConfig.TABLE_TOPIC_SCHEMA_TYPE_CONFIG),
+
+        sameName(TopicConfig.KAFKA_LINKS_ID_CONFIG),
+        sameName(TopicConfig.KAFKA_LINKS_TOPIC_START_TIME_CONFIG),
+        sameName(TopicConfig.KAFKA_LINKS_TOPIC_STATE_CONFIG),
         // AutoMQ inject end
 
         sameNameWithLogPrefix(TopicConfig.PREALLOCATE_CONFIG),

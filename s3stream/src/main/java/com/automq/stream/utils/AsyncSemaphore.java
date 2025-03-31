@@ -11,14 +11,13 @@
 
 package com.automq.stream.utils;
 
-import com.automq.stream.utils.threads.EventLoop;
-
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.util.LinkedList;
 import java.util.Queue;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.Executor;
 import java.util.function.Supplier;
 
 public class AsyncSemaphore {
@@ -36,11 +35,11 @@ public class AsyncSemaphore {
      * @param requiredPermits the required permits
      * @param task            task to run when the permits are available, the task should return a CompletableFuture
      *                        which will be completed when the permits could be released.
-     * @param eventLoop       the eventLoop to run the task when the permits are available
+     * @param executor       the executor to run the task when the permits are available
      * @return true if the permits are acquired, false if the task is added to the waiting queue.
      */
     public synchronized boolean acquire(long requiredPermits, Supplier<CompletableFuture<?>> task,
-        EventLoop eventLoop) {
+        Executor executor) {
         if (permits >= 0) {
             // allow permits minus to negative
             permits -= requiredPermits;
@@ -48,10 +47,11 @@ public class AsyncSemaphore {
                 task.get().whenComplete((nil, ex) -> release(requiredPermits));
             } catch (Throwable e) {
                 LOGGER.error("Error in task", e);
+                release(requiredPermits);
             }
             return true;
         } else {
-            tasks.add(new AsyncSemaphoreTask(requiredPermits, task, eventLoop));
+            tasks.add(new AsyncSemaphoreTask(requiredPermits, task, executor));
             return false;
         }
     }
@@ -69,8 +69,8 @@ public class AsyncSemaphore {
         if (permits > 0) {
             AsyncSemaphoreTask t = tasks.poll();
             if (t != null) {
-                // use eventLoop to reset the thread stack to avoid stack overflow
-                t.eventLoop.execute(() -> acquire(t.requiredPermits, t.task, t.eventLoop));
+                // use executor to reset the thread stack to avoid stack overflow
+                t.executor.execute(() -> acquire(t.requiredPermits, t.task, t.executor));
             }
         }
     }
@@ -78,12 +78,12 @@ public class AsyncSemaphore {
     static class AsyncSemaphoreTask {
         final long requiredPermits;
         final Supplier<CompletableFuture<?>> task;
-        final EventLoop eventLoop;
+        final Executor executor;
 
-        public AsyncSemaphoreTask(long requiredPermits, Supplier<CompletableFuture<?>> task, EventLoop eventLoop) {
+        public AsyncSemaphoreTask(long requiredPermits, Supplier<CompletableFuture<?>> task, Executor executor) {
             this.requiredPermits = requiredPermits;
             this.task = task;
-            this.eventLoop = eventLoop;
+            this.executor = executor;
         }
     }
 }

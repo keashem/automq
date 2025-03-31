@@ -52,6 +52,9 @@ import java.util.concurrent.atomic.AtomicLong;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
+import io.github.bucket4j.BlockingBucket;
+import io.github.bucket4j.Bucket;
+
 import static org.apache.kafka.tools.automq.perf.ProducerService.HEADER_KEY_CHARSET;
 import static org.apache.kafka.tools.automq.perf.ProducerService.HEADER_KEY_SEND_TIME_NANOS;
 
@@ -63,8 +66,7 @@ public class ConsumerService implements AutoCloseable {
     private final List<Group> groups = new ArrayList<>();
     private final String groupSuffix;
 
-    public ConsumerService(String bootstrapServer) {
-        Properties properties = new Properties();
+    public ConsumerService(String bootstrapServer, Properties properties) {
         properties.put(AdminClientConfig.BOOTSTRAP_SERVERS_CONFIG, bootstrapServer);
         properties.put(AdminClientConfig.REQUEST_TIMEOUT_MS_CONFIG, (int) TimeUnit.MINUTES.toMillis(2));
         properties.put(AdminClientConfig.DEFAULT_API_TIMEOUT_MS_CONFIG, (int) TimeUnit.MINUTES.toMillis(10));
@@ -91,10 +93,15 @@ public class ConsumerService implements AutoCloseable {
         return count;
     }
 
-    public void start(ConsumerCallback callback) {
+    public void start(ConsumerCallback callback, int pollRate) {
+        BlockingBucket bucket = rateLimitBucket(pollRate);
+        ConsumerCallback callbackWithRateLimit = (tp, p, st) -> {
+            callback.messageReceived(tp, p, st);
+            bucket.consume(1);
+        };
         CompletableFuture.allOf(
             groups.stream()
-                .map(group -> group.start(callback))
+                .map(group -> group.start(callbackWithRateLimit))
                 .toArray(CompletableFuture[]::new)
         ).join();
     }
@@ -122,6 +129,15 @@ public class ConsumerService implements AutoCloseable {
             .sum();
     }
 
+    private BlockingBucket rateLimitBucket(int rateLimit) {
+        return Bucket.builder()
+            .addLimit(limit -> limit
+                .capacity(rateLimit / 10)
+                .refillGreedy(rateLimit, Duration.ofSeconds(1))
+            ).build()
+            .asBlocking();
+    }
+
     @Override
     public void close() {
         admin.close();
@@ -137,21 +153,21 @@ public class ConsumerService implements AutoCloseable {
          * @param payload        the received message payload
          * @param sendTimeNanos  the time in nanoseconds when the message was sent
          */
-        void messageReceived(TopicPartition topicPartition, byte[] payload, long sendTimeNanos);
+        void messageReceived(TopicPartition topicPartition, byte[] payload, long sendTimeNanos) throws InterruptedException;
     }
 
     public static class ConsumersConfig {
         final String bootstrapServer;
         final int groupsPerTopic;
         final int consumersPerGroup;
-        final Map<String, String> consumerConfigs;
+        final Properties properties;
 
         public ConsumersConfig(String bootstrapServer, int groupsPerTopic, int consumersPerGroup,
-            Map<String, String> consumerConfigs) {
+            Properties properties) {
             this.bootstrapServer = bootstrapServer;
             this.groupsPerTopic = groupsPerTopic;
             this.consumersPerGroup = consumersPerGroup;
-            this.consumerConfigs = consumerConfigs;
+            this.properties = properties;
         }
     }
 
@@ -224,7 +240,7 @@ public class ConsumerService implements AutoCloseable {
 
         private Properties toProperties(ConsumersConfig config) {
             Properties properties = new Properties();
-            properties.putAll(config.consumerConfigs);
+            properties.putAll(config.properties);
             properties.put(ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, config.bootstrapServer);
             properties.put(ConsumerConfig.KEY_DESERIALIZER_CLASS_CONFIG, StringDeserializer.class.getName());
             properties.put(ConsumerConfig.VALUE_DESERIALIZER_CLASS_CONFIG, ByteArrayDeserializer.class.getName());
@@ -316,7 +332,7 @@ public class ConsumerService implements AutoCloseable {
                         TopicPartition topicPartition = new TopicPartition(record.topic(), record.partition());
                         callback.messageReceived(topicPartition, record.value(), sendTimeNanos);
                     }
-                } catch (InterruptException e) {
+                } catch (InterruptException | InterruptedException e) {
                     // ignore, as we are closing
                 } catch (Exception e) {
                     LOGGER.warn("exception occur while consuming message", e);

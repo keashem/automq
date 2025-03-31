@@ -9,20 +9,15 @@
  * by the Apache License, Version 2.0
  */
 
-package kafka.automq.zonerouter;
+package com.automq.stream.s3.streams;
 
-public enum ClientType {
-    PRODUCER, CONSUMER;
+import com.automq.stream.s3.metadata.StreamMetadata;
 
-    public static ClientType parse(String str) {
-        switch (str) {
-            case "producer":
-                return PRODUCER;
-            case "consumer":
-                return CONSUMER;
-            default:
-                return null;
-        }
+public interface StreamMetadataListener {
+
+    void onNewStreamMetadata(StreamMetadata metadata);
+
+    interface Handle {
+        void close();
     }
-
 }

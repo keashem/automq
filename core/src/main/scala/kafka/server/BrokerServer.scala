@@ -18,7 +18,8 @@
 package kafka.server
 
 import kafka.automq.backpressure.{BackPressureConfig, BackPressureManager, DefaultBackPressureManager, Regulator}
-import kafka.automq.zonerouter.{NoopProduceRouter, ProduceRouter}
+import kafka.automq.kafkalinking.KafkaLinkingManager
+import kafka.automq.interceptor.{NoopTrafficInterceptor, TrafficInterceptor}
 import kafka.cluster.EndPoint
 import kafka.coordinator.group.{CoordinatorLoaderImpl, CoordinatorPartitionWriter, GroupCoordinatorAdapter}
 import kafka.coordinator.transaction.{ProducerIdManager, TransactionCoordinator}
@@ -159,7 +160,7 @@ class BrokerServer(
 
   def metadataLoader: MetadataLoader = sharedServer.loader
 
-  var produceRouter: ProduceRouter = _
+  var trafficInterceptor: TrafficInterceptor = _
 
   var backPressureManager: BackPressureManager = _
   // AutoMQ inject end
@@ -351,12 +352,17 @@ class BrokerServer(
         addPartitionsToTxnManager = Some(addPartitionsToTxnManager),
         directoryEventHandler = directoryEventHandler
       )
+      this._replicaManager.setKafkaLinkingManager(newKafkaLinkingManager())
 
       /* start token manager */
       tokenManager = new DelegationTokenManager(config, tokenCache, time)
       tokenManager.startup()
 
       groupCoordinator = createGroupCoordinator()
+
+      // AutoMQ injection start
+      groupCoordinator = createGroupCoordinatorWrapper(groupCoordinator)
+      // AutoMQ injection end
 
       val producerIdManagerSupplier = () => ProducerIdManager.rpc(
         config.brokerId,
@@ -553,7 +559,7 @@ class BrokerServer(
 
       // AutoMQ inject start
       ElasticLogManager.init(config, clusterId, this)
-      produceRouter = newProduceRouter()
+      trafficInterceptor = newTrafficInterceptor()
 
       newPartitionLifecycleListeners().forEach(l => {
         _replicaManager.addPartitionLifecycleListener(l)
@@ -637,6 +643,10 @@ class BrokerServer(
         metrics
       )
     }
+  }
+
+  protected def createGroupCoordinatorWrapper(groupCoordinator: GroupCoordinator): GroupCoordinator = {
+    groupCoordinator
   }
 
   protected def createRemoteLogManager(): Option[RemoteLogManager] = {
@@ -807,10 +817,10 @@ class BrokerServer(
     )
   }
 
-  protected def newProduceRouter(): ProduceRouter = {
-    val produceRouter = new NoopProduceRouter(dataPlaneRequestProcessor.asInstanceOf[ElasticKafkaApis], metadataCache)
-    dataPlaneRequestProcessor.asInstanceOf[ElasticKafkaApis].setProduceRouter(produceRouter)
-    produceRouter
+  protected def newTrafficInterceptor(): TrafficInterceptor = {
+    val trafficInterceptor = new NoopTrafficInterceptor(dataPlaneRequestProcessor.asInstanceOf[ElasticKafkaApis], metadataCache)
+    dataPlaneRequestProcessor.asInstanceOf[ElasticKafkaApis].setTrafficInterceptor(trafficInterceptor)
+    trafficInterceptor
   }
 
   protected def newPartitionLifecycleListeners(): util.List[PartitionLifecycleListener] = {
@@ -825,6 +835,10 @@ class BrokerServer(
       override def decrease(): Unit = {
       }
     }
+  }
+
+  protected def newKafkaLinkingManager(): KafkaLinkingManager = {
+    null
   }
   // AutoMQ inject end
 

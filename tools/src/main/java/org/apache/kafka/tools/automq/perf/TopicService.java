@@ -25,11 +25,10 @@ import com.google.common.collect.Lists;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
-import java.util.Set;
+import java.util.Properties;
 import java.util.concurrent.ExecutionException;
 import java.util.stream.Collectors;
 import java.util.stream.IntStream;
@@ -50,10 +49,9 @@ public class TopicService implements AutoCloseable {
 
     private final Admin admin;
 
-    public TopicService(String bootstrapServer, Map<String, String> adminConfigs) {
-        Map<String, Object> configs = new HashMap<>(adminConfigs);
-        configs.put(AdminClientConfig.BOOTSTRAP_SERVERS_CONFIG, bootstrapServer);
-        this.admin = Admin.create(configs);
+    public TopicService(String bootstrapServer, Properties properties) {
+        properties.put(AdminClientConfig.BOOTSTRAP_SERVERS_CONFIG, bootstrapServer);
+        this.admin = Admin.create(properties);
     }
 
     /**
@@ -87,10 +85,11 @@ public class TopicService implements AutoCloseable {
     public int deleteTopics() {
         ListTopicsResult result = admin.listTopics();
         try {
-            Set<String> topics = result.names().get();
-            topics.removeIf(name -> name.startsWith(COMMON_TOPIC_PREFIX));
-            admin.deleteTopics(topics).all().get();
-            return topics.size();
+            List<String> toDelete = result.names().get().stream()
+                .filter(name -> name.startsWith(COMMON_TOPIC_PREFIX))
+                .collect(Collectors.toList());
+            admin.deleteTopics(toDelete).all().get();
+            return toDelete.size();
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
         } catch (ExecutionException ignored) {
@@ -109,7 +108,9 @@ public class TopicService implements AutoCloseable {
             Thread.currentThread().interrupt();
         } catch (ExecutionException e) {
             if (e.getCause() instanceof TopicExistsException) {
-                LOGGER.debug("Topic already exists. name={}", name);
+                if (LOGGER.isDebugEnabled()) {
+                    LOGGER.debug("Topic already exists. name={}", name);
+                }
             } else {
                 LOGGER.error("Failed to create topic. name={}", name, e);
                 throw new RuntimeException(e);

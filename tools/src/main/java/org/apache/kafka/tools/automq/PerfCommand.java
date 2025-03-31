@@ -87,7 +87,7 @@ public class PerfCommand implements AutoCloseable {
         this.config = config;
         this.topicService = new TopicService(config.bootstrapServer(), config.adminConfig());
         this.producerService = new ProducerService();
-        this.consumerService = new ConsumerService(config.bootstrapServer());
+        this.consumerService = new ConsumerService(config.bootstrapServer(), config.adminConfig());
     }
 
     private void run() {
@@ -95,9 +95,9 @@ public class PerfCommand implements AutoCloseable {
         TimerUtil timer = new TimerUtil();
 
         if (config.reset) {
-            LOGGER.info("Deleting all topics...");
+            LOGGER.info("Deleting all test topics...");
             int deleted = topicService.deleteTopics();
-            LOGGER.info("Deleted all topics ({} in total), took {} ms", deleted, timer.elapsedAndResetAs(TimeUnit.MILLISECONDS));
+            LOGGER.info("Deleted all test topics ({} in total), took {} ms", deleted, timer.elapsedAndResetAs(TimeUnit.MILLISECONDS));
         }
 
         LOGGER.info("Creating topics...");
@@ -106,7 +106,7 @@ public class PerfCommand implements AutoCloseable {
 
         LOGGER.info("Creating consumers...");
         int consumers = consumerService.createConsumers(topics, config.consumersConfig());
-        consumerService.start(this::messageReceived);
+        consumerService.start(this::messageReceived, config.maxConsumeRecordRate);
         LOGGER.info("Created {} consumers, took {} ms", consumers, timer.elapsedAndResetAs(TimeUnit.MILLISECONDS));
 
         LOGGER.info("Creating producers...");

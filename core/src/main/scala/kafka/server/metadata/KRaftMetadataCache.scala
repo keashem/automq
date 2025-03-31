@@ -40,11 +40,12 @@ import org.apache.kafka.metadata.{BrokerRegistration, PartitionRegistration, Rep
 import org.apache.kafka.server.common.automq.AutoMQVersion
 import org.apache.kafka.server.common.{FinalizedFeatures, KRaftVersion, MetadataVersion}
 
+import java.nio.ByteBuffer
 import java.util
 import java.util.concurrent.ThreadLocalRandom
 import java.util.concurrent.locks.ReentrantLock
 import java.util.function.Supplier
-import java.util.{Collections, Properties}
+import java.util.{Collections, OptionalLong, Properties}
 import scala.collection.mutable.ListBuffer
 import scala.collection.{Map, Seq, Set, mutable}
 import scala.compat.java8.OptionConverters._
@@ -118,7 +119,7 @@ class KRaftMetadataCache(
       streamMetadata.state == StreamState.OPENED &&
       streamMetadata.lastRange().nodeId() == tpRegistration.leader
 
-    if (!result) {
+    if (!result && isDebugEnabled) {
       debug(s"Failover failed for topicPartition $topicPartition, tpEpoch $tpRegistration, streamMetadata ${streamMetadata}")
     }
 
@@ -657,6 +658,14 @@ class KRaftMetadataCache(
 
   override def getNode(nodeId: Int): BrokerRegistration = {
     _currentImage.cluster().broker(nodeId)
+  }
+
+  override def getValue(key: String): ByteBuffer = {
+    _currentImage.kv().getValue(key)
+  }
+
+  override def getStreamEndOffset(streamId: Long): OptionalLong = {
+    _currentImage.streamsMetadata().streamEndOffset(streamId)
   }
   // AutoMQ inject end
 

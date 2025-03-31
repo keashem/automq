@@ -64,6 +64,7 @@ import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.Lock;
 import java.util.concurrent.locks.ReadWriteLock;
@@ -84,7 +85,7 @@ public class S3Storage implements Storage {
 
     private static final int NUM_STREAM_CALLBACK_LOCKS = 128;
     private final long maxDeltaWALCacheSize;
-    private final Config config;
+    protected final Config config;
     private final WriteAheadLog deltaWAL;
     /**
      * WAL log cache
@@ -98,6 +99,14 @@ public class S3Storage implements Storage {
     private final Queue<DeltaWALUploadTaskContext> walPrepareQueue = new LinkedList<>();
     private final Queue<DeltaWALUploadTaskContext> walCommitQueue = new LinkedList<>();
     private final List<DeltaWALUploadTaskContext> inflightWALUploadTasks = new CopyOnWriteArrayList<>();
+    /**
+     * A lock to ensure only one thread can trigger {@link #forceUpload()} in {@link #maybeForceUpload()}
+     */
+    private final AtomicBoolean forceUploadScheduled = new AtomicBoolean();
+    /**
+     * A lock to ensure only one thread can trigger {@link #forceUpload()} in {@link #forceUploadCallback()}
+     */
+    private final AtomicBoolean needForceUpload = new AtomicBoolean();
     private final ScheduledExecutorService backgroundExecutor = Threads.newSingleThreadScheduledExecutor(
         ThreadUtils.createThreadFactory("s3-storage-background", true), LOGGER);
     private final ExecutorService uploadWALExecutor = Threads.newFixedThreadPoolWithMonitor(
@@ -110,11 +119,11 @@ public class S3Storage implements Storage {
     private final FutureTicker forceUploadTicker = new FutureTicker(100, TimeUnit.MILLISECONDS, backgroundExecutor);
     private final Queue<WalWriteRequest> backoffRecords = new LinkedBlockingQueue<>();
     private final ScheduledFuture<?> drainBackoffTask;
-    private final StreamManager streamManager;
-    private final ObjectManager objectManager;
-    private final ObjectStorage objectStorage;
-    private final S3BlockCache blockCache;
-    private final StorageFailureHandler storageFailureHandler;
+    protected final StreamManager streamManager;
+    protected final ObjectManager objectManager;
+    protected final ObjectStorage objectStorage;
+    protected final S3BlockCache blockCache;
+    protected final StorageFailureHandler storageFailureHandler;
     /**
      * Stream callback locks. Used to ensure the stream callbacks will not be called concurrently.
      *
@@ -141,6 +150,9 @@ public class S3Storage implements Storage {
         this.drainBackoffTask = this.backgroundExecutor.scheduleWithFixedDelay(this::tryDrainBackoffRecords, 100, 100, TimeUnit.MILLISECONDS);
         S3StreamMetricsManager.registerInflightWALUploadTasksCountSupplier(this.inflightWALUploadTasks::size);
         S3StreamMetricsManager.registerDeltaWalPendingUploadBytesSupplier(this.pendingUploadBytes::get);
+        if (config.walUploadIntervalMs() > 0) {
+            this.backgroundExecutor.scheduleWithFixedDelay(this::maybeForceUpload, config.walUploadIntervalMs(), config.walUploadIntervalMs(), TimeUnit.MILLISECONDS);
+        }
     }
 
     /**
@@ -281,6 +293,14 @@ public class S3Storage implements Storage {
                 continue;
             }
 
+            // During the WAL recovery, when restored data is split into StreamObjects, we will upload each StreamObject
+            // individually. This implementation causes the ByteBuf allocated by WriteAheadLog#recover to be released in
+            // a fragmented manner, potentially generating significant memory fragmentation.
+            // To avoid this issue, we optimize memory management by proactively releasing the ByteBuf through the
+            // StreamRecordBatch#encoded method invocation, thereby centralizing memory release operations and
+            // preventing memory fragmentation.
+            streamRecordBatch.encoded();
+
             Long expectNextOffset = streamNextOffsets.get(streamId);
             Queue<StreamRecordBatch> discontinuousRecords = streamDiscontinuousRecords.get(streamId);
             if (expectNextOffset == null || expectNextOffset == streamRecordBatch.getBaseOffset()) {
@@ -365,8 +385,7 @@ public class S3Storage implements Storage {
 
         if (cacheBlock.size() != 0) {
             logger.info("try recover from crash, recover records bytes size {}", cacheBlock.size());
-            DeltaWALUploadTask task = DeltaWALUploadTask.builder().config(config).streamRecordsMap(cacheBlock.records())
-                .objectManager(objectManager).objectStorage(objectStorage).executor(uploadWALExecutor).build();
+            UploadWriteAheadLogTask task = newUploadWriteAheadLogTask(cacheBlock.records(), objectManager, Long.MAX_VALUE);
             task.prepare().thenCompose(nil -> task.upload()).thenCompose(nil -> task.commit()).get();
             cacheBlock.records().forEach((streamId, records) -> records.forEach(StreamRecordBatch::release));
         }
@@ -460,7 +479,7 @@ public class S3Storage implements Storage {
             } catch (OverCapacityException e) {
                 // the WAL write data align with block, 'WAL is full but LogCacheBlock is not full' may happen.
                 confirmOffsetCalculator.update();
-                forceUpload(LogCache.MATCH_ALL_STREAMS);
+                maybeForceUpload();
                 if (!fromBackoff) {
                     backoffRecords.offer(request);
                 }
@@ -597,6 +616,42 @@ public class S3Storage implements Storage {
     }
 
     /**
+     * Limit the number of inflight force upload tasks to 1 to avoid too many S3 objects.
+     */
+    private void maybeForceUpload() {
+        if (hasInflightForceUploadTask()) {
+            // There is already an inflight force upload task, trigger another one later after it completes.
+            needForceUpload.set(true);
+            return;
+        }
+        if (forceUploadScheduled.compareAndSet(false, true)) {
+            forceUpload();
+        } else {
+            // There is already a force upload task scheduled, do nothing.
+            needForceUpload.set(true);
+        }
+    }
+
+    private boolean hasInflightForceUploadTask() {
+        return inflightWALUploadTasks.stream().anyMatch(it -> it.force);
+    }
+
+    private CompletableFuture<Void> forceUpload() {
+        CompletableFuture<Void> cf = forceUpload(LogCache.MATCH_ALL_STREAMS);
+        cf.whenComplete((nil, ignored) -> forceUploadCallback());
+        return cf;
+    }
+
+    private void forceUploadCallback() {
+        // Reset the force upload flag after the task completes.
+        forceUploadScheduled.set(false);
+        if (needForceUpload.compareAndSet(true, false)) {
+            // Force upload needs to be triggered again.
+            forceUpload();
+        }
+    }
+
+    /**
      * Force upload stream WAL cache to S3. Use group upload to avoid generate too many S3 objects when broker shutdown.
      * {@code streamId} can be {@link LogCache#MATCH_ALL_STREAMS} to force upload all streams.
      */
@@ -656,6 +711,11 @@ public class S3Storage implements Storage {
 
     private Lock getStreamCallbackLock(long streamId) {
         return streamCallbackLocks[(int) ((streamId & Long.MAX_VALUE) % NUM_STREAM_CALLBACK_LOCKS)];
+    }
+
+    protected UploadWriteAheadLogTask newUploadWriteAheadLogTask(Map<Long, List<StreamRecordBatch>> streamRecordsMap, ObjectManager objectManager, double rate) {
+        return DefaultUploadWriteAheadLogTask.builder().config(config).streamRecordsMap(streamRecordsMap)
+            .objectManager(objectManager).objectStorage(objectStorage).executor(uploadWALExecutor).build();
     }
 
     @SuppressWarnings("UnusedReturnValue")
@@ -733,14 +793,7 @@ public class S3Storage implements Storage {
             }
             rate = maxDataWriteRate;
         }
-        context.task = DeltaWALUploadTask.builder()
-            .config(config)
-            .streamRecordsMap(context.cache.records())
-            .objectManager(objectManager)
-            .objectStorage(objectStorage)
-            .executor(uploadWALExecutor)
-            .rate(rate)
-            .build();
+        context.task = newUploadWriteAheadLogTask(context.cache.records(), objectManager, rate);
         boolean walObjectPrepareQueueEmpty = walPrepareQueue.isEmpty();
         walPrepareQueue.add(context);
         if (!walObjectPrepareQueueEmpty) {
@@ -1027,7 +1080,7 @@ public class S3Storage implements Storage {
     public static class DeltaWALUploadTaskContext {
         TimerUtil timer;
         LogCache.LogCacheBlock cache;
-        DeltaWALUploadTask task;
+        UploadWriteAheadLogTask task;
         CompletableFuture<Void> cf;
         ObjectManager objectManager;
         /**
